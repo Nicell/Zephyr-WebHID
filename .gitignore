@@ -1,0 +1,7 @@
+**/.west
+**/zephyr
+**/build
+**/bootloader
+**/modules
+**/tools
+*.DS_Store

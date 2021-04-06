@@ -1,0 +1,4 @@
+# Copyright (c) 2021 Nicholas Winans
+# SPDX-License-Identifier: MIT
+
+source "Kconfig.zephyr"
