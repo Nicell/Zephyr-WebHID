@@ -8,9 +8,9 @@
 #include <stdio.h>
 #include <zephyr.h>
 
-
 #include <device.h>
 #include <drivers/gpio.h>
+#include <settings/settings.h>
 #include <usb/class/usb_hid.h>
 #include <usb/usb_device.h>
 
@@ -19,8 +19,6 @@ LOG_MODULE_REGISTER(main);
 
 static bool configured;
 static const struct device *hdev;
-static struct gpio_callback btn_cb;
-static int press_count = 0;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 
 #define HID_EP_BUSY_FLAG 0
@@ -28,8 +26,10 @@ static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 
 struct report {
   uint8_t id;
-  char value[64];
+  uint8_t value[64];
 };
+
+static uint8_t led_value = 0;
 
 static const uint8_t hid_report_desc[] = {
     HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
@@ -57,7 +57,7 @@ static const uint8_t hid_report_desc[] = {
     HID_END_COLLECTION,
 };
 
-static void set_leds(char led_status) {
+static void set_leds(uint8_t led_status) {
   const struct device *gpio0 = device_get_binding("GPIO_0");
   gpio_pin_set(gpio0, 13, led_status & 1);
   gpio_pin_set(gpio0, 14, (led_status >> 1) & 1);
@@ -72,7 +72,7 @@ static void send_in_report(struct k_work *work) {
     static struct report report_1 = {
         .id = REPORT_ID_1,
     };
-    sprintf(report_1.value, "Button pressed %d times.", press_count);
+    report_1.value[0] = led_value;
 
     ret =
         hid_int_ep_write(hdev, (uint8_t *)&report_1, sizeof(report_1), &wrote);
@@ -86,19 +86,13 @@ static void send_in_report(struct k_work *work) {
   }
 }
 
-K_WORK_DEFINE(in_report, send_in_report);
-
-static void button_pressed(const struct device *dev, struct gpio_callback *cb,
-                           uint32_t pins) {
-  press_count++;
-  k_work_submit(&in_report);
-}
-
 static void int_in_ready_cb(const struct device *dev) {
   if (!atomic_test_and_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
     LOG_WRN("IN endpoint callback without preceding buffer write");
   }
 }
+
+K_WORK_DEFINE(in_report, send_in_report);
 
 static void int_out_ready_cb(const struct device *dev) {
   struct report report_2;
@@ -106,11 +100,20 @@ static void int_out_ready_cb(const struct device *dev) {
   ret = hid_int_ep_read(dev, (uint8_t *)&report_2, sizeof(report_2), &read);
 
   if (ret == 0 && read > 0) {
-    if (report_2.value[0] != 0) {
-      // non-zero out report
-      set_leds(report_2.value[0]);
-
-      LOG_DBG("Got HID in '%s'", report_2.value);
+    switch (report_2.value[0]) {
+    case 1: // Set LED report
+      LOG_DBG("Got set LED report");
+      led_value = report_2.value[1];
+      set_leds(led_value);
+      break;
+    case 2: // Save LED setting report
+      LOG_DBG("Got save LED setting report");
+      settings_save_one("led/bits", &led_value, sizeof(led_value));
+      break;
+    case 3: // Read LED setting report
+      LOG_DBG("Got read LED value report");
+      k_work_submit(&in_report);
+      break;
     }
   } else {
     LOG_ERR("Failed to read out report");
@@ -153,18 +156,39 @@ static void init_gpio() {
   set_leds('\0');
 }
 
-static void init_btn() {
-  const struct device *gpio0 = device_get_binding("GPIO_0");
-  gpio_pin_configure(gpio0, 11, GPIO_PULL_UP | GPIO_ACTIVE_LOW);
-  gpio_pin_interrupt_configure(gpio0, 11, GPIO_INT_EDGE_TO_ACTIVE);
+static int led_settings_set(const char *name, size_t len,
+                            settings_read_cb read_cb, void *cb_arg) {
+  const char *next;
+  int rc;
 
-  gpio_init_callback(&btn_cb, button_pressed, BIT(11));
-  gpio_add_callback(gpio0, &btn_cb);
+  if (settings_name_steq(name, "bits", &next) && !next) {
+    if (len != sizeof(led_value)) {
+      return -EINVAL;
+    }
+
+    rc = read_cb(cb_arg, &led_value, sizeof(led_value));
+    if (rc >= 0) {
+      set_leds(led_value);
+      return 0;
+    }
+
+    return rc;
+  }
+
+  return -ENOENT;
 }
+
+struct settings_handler led_settings = {
+    .name = "led",
+    .h_set = led_settings_set,
+};
 
 void main(void) {
   init_gpio();
-  init_btn();
+
+  settings_subsys_init();
+  settings_register(&led_settings);
+  settings_load();
 
   int ret = usb_enable(status_cb);
   if (ret != 0) {
